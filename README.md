@@ -20,12 +20,69 @@ Invoke in Claude Code:
 
 ## Architecture
 
+```mermaid
+flowchart TD
+    A([💸 GCP Spending]) -->|reaches 100% threshold| B
+
+    subgraph BUDGET ["Budget Alert"]
+        B[📊 Cloud Billing Budget\nbudget-alerts]
+    end
+
+    subgraph MESSAGING ["Event Pipeline"]
+        C[📨 Pub/Sub Topic\nbudget-alerts]
+        D[⚡ Eventarc Trigger\nbudget-kill-trigger]
+    end
+
+    subgraph FUNCTION ["Cloud Run Function Gen2"]
+        E[🔧 billing-kill-switch\nasia-southeast2]
+        E1{cost >= budget?}
+        E2[Disable Billing\nvia Cloud Billing API]
+        E3[Log CRITICAL\nstructured JSON]
+    end
+
+    subgraph NOTIFICATIONS ["Notifications"]
+        F[💬 Google Chat\nSRE Alert AI Space]
+        G[📧 Cloud Monitoring\nEmail Alert]
+        H[📋 Cloud Logging\nAudit Trail]
+    end
+
+    subgraph TARGET ["Protected Project"]
+        I[🔒 GCP Project\nBilling DISABLED]
+    end
+
+    B -->|publishes event| C
+    C --> D
+    D -->|triggers| E
+    E --> E1
+    E1 -->|No: cost < budget| Z([✅ No action])
+    E1 -->|Yes: cost >= budget| E2
+    E2 --> E3
+    E2 -->|unlink billing account| I
+    E2 -->|webhook POST| F
+    E3 -->|log ingestion| H
+    H -->|log-based alert\nconditionMatchedLog| G
+
+    style BUDGET fill:#fff3cd,stroke:#ffc107
+    style MESSAGING fill:#d1ecf1,stroke:#17a2b8
+    style FUNCTION fill:#d4edda,stroke:#28a745
+    style NOTIFICATIONS fill:#e2d9f3,stroke:#6f42c1
+    style TARGET fill:#f8d7da,stroke:#dc3545
+    style I fill:#f8d7da,stroke:#dc3545,color:#721c24
 ```
-Budget Alert (100%) → Pub/Sub (budget-alerts) → Eventarc → Cloud Run → Cloud Billing API (unlink)
-                                                                      ↓
-                                                           Google Chat Webhook
-                                                           Cloud Monitoring Email
-```
+
+### Component Table
+
+| # | Component | Technology | Role |
+|---|---|---|---|
+| 1 | Budget Alert | Cloud Billing | Detects spend ≥ 100% budget |
+| 2 | Pub/Sub Topic | `budget-alerts` | Event broker |
+| 3 | Eventarc Trigger | `budget-kill-trigger` | Routes Pub/Sub → Cloud Run |
+| 4 | Cloud Run Function | Python 3.12, Gen2 | Kill switch logic |
+| 5 | Cloud Billing API | `updateProjectBillingInfo` | Unlinks billing from project |
+| 6 | Google Chat | Incoming Webhook | Real-time alert to Space |
+| 7 | Cloud Monitoring | Log-based alert policy | Email notification on trigger |
+| 8 | Secret Manager | `gchat-killswitch-webhook` | Stores webhook URL securely |
+| 9 | Cloud Logging | Structured JSON logs | Full audit trail |
 
 ## What the Skill Does (Fully Automated)
 
