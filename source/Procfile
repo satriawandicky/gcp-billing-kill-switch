@@ -1,0 +1,1 @@
+web: functions-framework --target=kill_switch --signature-type=cloudevent

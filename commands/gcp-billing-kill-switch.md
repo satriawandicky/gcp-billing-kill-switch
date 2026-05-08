@@ -1,6 +1,6 @@
 # GCP Billing Kill Switch
 
-Deploy a serverless kill switch that automatically disables GCP project billing when a 100% budget alert fires. Uses Pub/Sub + Eventarc + Cloud Run (Gen2). Fully automated — no manual steps except the final Budget Alert connection (Console-only limitation by GCP).
+Deploy a serverless GCP billing kill switch. Automatically disables project billing when a 100% budget alert fires. Uses Pub/Sub + Eventarc + Cloud Run Gen2. Fully automated — no manual steps except connecting the budget alert to Pub/Sub (GCP Console limitation).
 
 ## Steps
 
@@ -10,7 +10,9 @@ Ask the user for:
 - `PROJECT_ID` — GCP project to protect
 - `BILLING_ACCOUNT_ID` — billing account linked to the project (format: `XXXXXX-XXXXXX-XXXXXX`)
 - `REGION` — Cloud Run region (default: `asia-southeast2`)
-- `SLACK_WEBHOOK_URL` — Slack webhook for notifications (optional, press Enter to skip)
+- `CURRENCY_CODE` — billing account currency (default: `USD`; use `IDR` for Elitery/Indonesian accounts)
+- `GCHAT_WEBHOOK_URL` — Google Chat Space webhook URL (optional, press Enter to skip)
+- `ALERT_EMAIL` — email address for Cloud Monitoring notification (optional)
 
 Confirm inputs with the user before proceeding.
 
@@ -24,6 +26,8 @@ gcloud services enable \
   eventarc.googleapis.com \
   cloudbuild.googleapis.com \
   secretmanager.googleapis.com \
+  monitoring.googleapis.com \
+  logging.googleapis.com \
   --project=PROJECT_ID
 ```
 
@@ -44,9 +48,14 @@ gcloud projects add-iam-policy-binding PROJECT_ID \
 gcloud projects add-iam-policy-binding PROJECT_ID \
   --member="serviceAccount:billing-killswitch-sa@PROJECT_ID.iam.gserviceaccount.com" \
   --role="roles/viewer"
+
+# Required to unlink billing at project level
+gcloud projects add-iam-policy-binding PROJECT_ID \
+  --member="serviceAccount:billing-killswitch-sa@PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/billing.projectManager"
 ```
 
-Grant `roles/billing.admin` at **Billing Account** level (critical):
+Grant `roles/billing.admin` at **Billing Account** level (critical — must be billing account level, not project):
 ```bash
 gcloud billing accounts add-iam-policy-binding BILLING_ACCOUNT_ID \
   --member="serviceAccount:billing-killswitch-sa@PROJECT_ID.iam.gserviceaccount.com" \
@@ -60,8 +69,6 @@ gcloud pubsub topics create budget-alerts --project=PROJECT_ID
 ```
 
 ### 5. Write Source Code
-
-Create a temp working directory and write the function files:
 
 ```bash
 mkdir -p /tmp/kill-switch-deploy
@@ -77,7 +84,7 @@ import functions_framework
 from google.cloud import billing_v1
 
 PROJECT_ID    = os.environ.get('GCP_PROJECT_ID')
-SLACK_WEBHOOK = os.environ.get('SLACK_WEBHOOK_URL', '')
+GCHAT_WEBHOOK = os.environ.get('GCHAT_WEBHOOK_URL', '')
 
 @functions_framework.cloud_event
 def kill_switch(cloud_event):
@@ -111,18 +118,31 @@ def kill_switch(cloud_event):
             f"Budget '{budget_name}': {cost_amount} >= {budget_amount} {currency}\n"
             f'Billing DISABLED for: {PROJECT_ID}'
         )
-        print(alert_msg)
-        _notify_slack(alert_msg)
+        # Structured log — triggers Cloud Monitoring alert
+        print(json.dumps({
+            'severity': 'CRITICAL',
+            'message': alert_msg,
+            'project_id': PROJECT_ID,
+            'budget_name': budget_name,
+            'cost_amount': cost_amount,
+            'budget_amount': budget_amount,
+            'currency': currency,
+        }))
+        _notify_gchat(alert_msg)
+
     except Exception as e:
-        print(f'ERROR disabling billing: {e}')
+        print(json.dumps({'severity': 'ERROR', 'message': f'ERROR disabling billing: {e}'}))
         raise
 
-def _notify_slack(text: str):
-    if not SLACK_WEBHOOK:
+
+def _notify_gchat(text: str):
+    if not GCHAT_WEBHOOK:
         return
-    payload = json.dumps({'text': f':rotating_light: *GCP Kill Switch*\n```{text}```'})
+    payload = json.dumps({
+        'text': f'🚨 *GCP Billing Kill Switch Triggered*\n```{text}```'
+    })
     req = urllib.request.Request(
-        SLACK_WEBHOOK,
+        GCHAT_WEBHOOK,
         data=payload.encode(),
         headers={'Content-Type': 'application/json'},
         method='POST'
@@ -136,36 +156,44 @@ functions-framework>=3.0.0
 google-cloud-billing>=1.11.0
 ```
 
-### 6. Deploy Cloud Run Function
+Write `/tmp/kill-switch-deploy/Procfile`:
+```
+web: functions-framework --target=kill_switch --signature-type=cloudevent
+```
 
-If user provided a Slack webhook, store it in Secret Manager first:
+> ⚠️ The `Procfile` is required. Without it, Cloud Run Buildpacks will try to find a `app` object in `main.py` and fail with 503.
+
+### 6. Store Google Chat Webhook (if provided)
+
 ```bash
-echo -n 'SLACK_WEBHOOK_URL' | \
-  gcloud secrets create slack-killswitch-webhook \
+echo -n 'GCHAT_WEBHOOK_URL' | \
+  gcloud secrets create gchat-killswitch-webhook \
   --data-file=- \
   --project=PROJECT_ID
 
-gcloud secrets add-iam-policy-binding slack-killswitch-webhook \
+gcloud secrets add-iam-policy-binding gchat-killswitch-webhook \
   --member="serviceAccount:billing-killswitch-sa@PROJECT_ID.iam.gserviceaccount.com" \
   --role="roles/secretmanager.secretAccessor" \
   --project=PROJECT_ID
 ```
 
-Deploy (with Slack):
+### 7. Deploy Cloud Run Function
+
+With Google Chat:
 ```bash
 gcloud run deploy billing-kill-switch \
   --source=/tmp/kill-switch-deploy \
   --region=REGION \
   --service-account=billing-killswitch-sa@PROJECT_ID.iam.gserviceaccount.com \
   --set-env-vars=GCP_PROJECT_ID=PROJECT_ID \
-  --set-secrets=SLACK_WEBHOOK_URL=slack-killswitch-webhook:latest \
+  --set-secrets=GCHAT_WEBHOOK_URL=gchat-killswitch-webhook:latest \
   --no-allow-unauthenticated \
   --max-instances=3 \
   --timeout=60 \
   --project=PROJECT_ID
 ```
 
-Deploy (without Slack):
+Without Google Chat:
 ```bash
 gcloud run deploy billing-kill-switch \
   --source=/tmp/kill-switch-deploy \
@@ -178,7 +206,7 @@ gcloud run deploy billing-kill-switch \
   --project=PROJECT_ID
 ```
 
-### 7. Create Eventarc Trigger
+### 8. Create Eventarc Trigger
 
 ```bash
 gcloud eventarc triggers create budget-kill-trigger \
@@ -191,86 +219,129 @@ gcloud eventarc triggers create budget-kill-trigger \
   --project=PROJECT_ID
 ```
 
-### 8. Verify Deployment
+Wait 2 minutes for trigger to become active before testing.
 
-Check Cloud Run service is running:
+### 9. Setup Cloud Monitoring Email Alert (if email provided)
+
+Create notification channel:
 ```bash
-gcloud run services describe billing-kill-switch \
-  --region=REGION \
+CHANNEL=$(gcloud beta monitoring channels create \
+  --display-name="Kill Switch Email Alert" \
+  --type=email \
+  --channel-labels=email_address=ALERT_EMAIL \
   --project=PROJECT_ID \
-  --format="value(status.conditions[0].status, status.url)"
+  --format="value(name)")
 ```
 
-Check Eventarc trigger is active:
+Create log-based alert policy using JSON:
 ```bash
-gcloud eventarc triggers describe budget-kill-trigger \
-  --location=REGION \
-  --project=PROJECT_ID \
-  --format="value(name, transport.pubsub.topic, destination.cloudRun.service)"
+cat > /tmp/kill-switch-alert-policy.json << EOF
+{
+  "displayName": "Kill Switch Triggered Alert",
+  "documentation": {
+    "content": "GCP Billing Kill Switch was triggered. Billing has been disabled for the project.",
+    "mimeType": "text/markdown"
+  },
+  "conditions": [
+    {
+      "displayName": "Kill switch log detected",
+      "conditionMatchedLog": {
+        "filter": "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"billing-kill-switch\" AND jsonPayload.message=~\"KILL SWITCH TRIGGERED\""
+      }
+    }
+  ],
+  "alertStrategy": {
+    "notificationRateLimit": {
+      "period": "300s"
+    }
+  },
+  "combiner": "OR",
+  "enabled": true,
+  "notificationChannels": ["CHANNEL_ID"]
+}
+EOF
+sed -i "s|CHANNEL_ID|$CHANNEL|g" /tmp/kill-switch-alert-policy.json
+gcloud alpha monitoring policies create \
+  --policy-from-file=/tmp/kill-switch-alert-policy.json \
+  --project=PROJECT_ID
 ```
 
-### 9. Test Kill Switch
+**Verify the email channel** — Google sends a verification code to the email address. Ask the user to check their inbox for a code like `G-XXXXXX`, then verify:
+```bash
+TOKEN=$(gcloud auth print-access-token)
+curl -s -X POST \
+  "https://monitoring.googleapis.com/v3/projects/PROJECT_ID/notificationChannels/CHANNEL_NUMERIC_ID:verify" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "x-goog-user-project: PROJECT_ID" \
+  -d '{"code": "G-XXXXXX"}'
+```
 
-Run a simulated budget exceeded event:
+Confirm `verificationStatus: "VERIFIED"` in the response.
+
+### 10. Test Kill Switch
+
 ```bash
 gcloud pubsub topics publish budget-alerts \
   --project=PROJECT_ID \
-  --message='{"budgetDisplayName":"TEST-KILL-SWITCH","costAmount":1000,"budgetAmount":100,"currencyCode":"USD"}'
+  --message='{"budgetDisplayName":"TEST-KILL-SWITCH","costAmount":1000,"budgetAmount":100,"currencyCode":"CURRENCY_CODE"}'
 ```
 
-Wait 5 seconds, then check logs:
+Wait ~20 seconds, then check logs:
 ```bash
 gcloud run services logs read billing-kill-switch \
   --region=REGION \
   --project=PROJECT_ID \
-  --limit=20
+  --limit=10
 ```
 
-Confirm log contains: `KILL SWITCH TRIGGERED`
+Verify billing is disabled:
+```bash
+gcloud beta billing projects describe PROJECT_ID --format="value(billingEnabled)"
+```
 
-Then re-link billing to restore:
+Expected: `False`
+
+Restore billing after test:
 ```bash
 gcloud billing projects link PROJECT_ID --billing-account=BILLING_ACCOUNT_ID
 ```
 
-### 10. Connect Budget Alert to Pub/Sub (Manual — GCP Console only)
+### 11. Connect Budget Alert to Pub/Sub
 
-Inform the user that this final step must be done via Console (GCP does not support this via gcloud):
-
-1. Go to: **Billing → Budgets & alerts**
-2. Edit the existing budget (or create new)
-3. Scroll to **Manage notifications**
-4. Check **Connect a Pub/Sub topic to this budget**
-5. Select: `projects/PROJECT_ID/topics/budget-alerts`
-6. Ensure a **100% threshold** rule exists
-7. Click **Save**
-
-### 11. Final Summary
-
-Print deployment summary:
-
-| Component | Status |
-|---|---|
-| APIs enabled | ✅ |
-| Service Account | ✅ billing-killswitch-sa@PROJECT_ID |
-| Pub/Sub Topic | ✅ budget-alerts |
-| Cloud Run Function | ✅ billing-kill-switch (REGION) |
-| Eventarc Trigger | ✅ budget-kill-trigger |
-| Slack Notification | ✅ / ⏭️ Skipped |
-| Budget Alert Connection | ⚠️ Manual step required (Console) |
-
-## Recovery
-
-If kill switch fires and billing is disabled, re-enable with:
+**For standard billing accounts** — via CLI:
 ```bash
-gcloud billing projects link PROJECT_ID --billing-account=BILLING_ACCOUNT_ID
+gcloud billing budgets create \
+  --billing-account=BILLING_ACCOUNT_ID \
+  --display-name="PROJECT_ID-killswitch-budget" \
+  --filter-projects="projects/PROJECT_ID" \
+  --budget-amount=AMOUNTCURRENCY \
+  --threshold-rule=percent=0.5 \
+  --threshold-rule=percent=0.9 \
+  --threshold-rule=percent=1.0 \
+  --notifications-rule-pubsub-topic=projects/PROJECT_ID/topics/budget-alerts \
+  --project=PROJECT_ID
 ```
+
+**For reseller sub-accounts (e.g. Elitery IDR)** — must use GCP Console:
+1. Billing → Budgets & alerts → Edit/create budget
+2. Manage notifications → Connect Pub/Sub topic → `projects/PROJECT_ID/topics/budget-alerts`
+3. Ensure 100% threshold exists → Save
+
+### 12. Final Summary
+
+Print deployment summary table with all components and their status.
+
+---
 
 ## Troubleshooting
 
-| Error | Fix |
-|---|---|
-| 403 on `updateBillingInfo` | `roles/billing.admin` must be at Billing Account level, not Project |
-| Function not triggered | Verify Eventarc trigger and Pub/Sub topic name match exactly |
-| Cloud Run deploy fails | Ensure `cloudbuild.googleapis.com` is enabled |
-| Billing not disabled after test | Check `GCP_PROJECT_ID` env var is Project ID string, not Project Number |
+| Error | Root Cause | Fix |
+|---|---|---|
+| Cloud Run 503 / `Failed to find attribute 'app'` | Missing `Procfile` for functions-framework | Add `Procfile: web: functions-framework --target=kill_switch --signature-type=cloudevent` |
+| 403 on `updateBillingInfo` | SA missing `roles/billing.projectManager` at project level | `gcloud projects add-iam-policy-binding ... --role="roles/billing.projectManager"` |
+| 403 on `updateBillingInfo` (billing account) | SA missing `roles/billing.admin` at billing account level | `gcloud billing accounts add-iam-policy-binding ...` |
+| Budget CLI `INVALID_ARGUMENT` | Reseller sub-account (e.g. IDR) doesn't support budget API | Create budget via Console instead |
+| Email notification not received | Email channel not verified | Send verification code and call `:verify` endpoint |
+| Function not triggered | Eventarc trigger not yet active | Wait 2 minutes after trigger creation |
+| Billing not disabled after test | Wrong `GCP_PROJECT_ID` env var | Ensure it's Project ID string, not Project Number |
