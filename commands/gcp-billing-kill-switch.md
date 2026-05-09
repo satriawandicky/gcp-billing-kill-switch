@@ -48,6 +48,22 @@ gcloud services enable \
   secretmanager.googleapis.com \
   monitoring.googleapis.com \
   logging.googleapis.com \
+  aiplatform.googleapis.com \
+  generativelanguage.googleapis.com \
+  cloudaicompanion.googleapis.com \
+  notebooks.googleapis.com \
+  language.googleapis.com \
+  documentai.googleapis.com \
+  vision.googleapis.com \
+  texttospeech.googleapis.com \
+  discoveryengine.googleapis.com \
+  speech.googleapis.com \
+  automl.googleapis.com \
+  dialogflow.googleapis.com \
+  translate.googleapis.com \
+  videointelligence.googleapis.com \
+  visionai.googleapis.com \
+  recommendationengine.googleapis.com \
   --project=PROJECT_ID
 ```
 
