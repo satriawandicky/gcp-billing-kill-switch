@@ -1,6 +1,24 @@
 # GCP Billing Kill Switch
 
-Deploy a serverless GCP billing kill switch. Automatically disables project billing when a 100% budget alert fires. Uses Pub/Sub + Eventarc + Cloud Run Gen2. Fully automated — no manual steps except connecting the budget alert to Pub/Sub (GCP Console limitation).
+Deploy a serverless GCP billing kill switch. Automatically disables project billing when a 100% budget alert fires. Uses Pub/Sub + Eventarc + Cloud Run Gen2. Fully automated — no manual steps except connecting the budget alert to Pub/Sub (GCP Console limitation for standard accounts; reseller sub-accounts can use REST API).
+
+---
+
+## Required Inputs (fill before running)
+
+| Variable             | Example                   | Description                                                  |
+|----------------------|---------------------------|--------------------------------------------------------------|
+| `PROJECT_ID`         | `my-project-prod`         | GCP project to protect (billing will be disabled on breach)  |
+| `BILLING_ACCOUNT_ID` | `01E24F-97C25D-DB772B`    | Billing account linked to the project                        |
+| `REGION`             | `asia-southeast2`         | Cloud Run deployment region (default: `us-central1`)         |
+| `BUDGET_AMOUNT`      | `100`                     | Monthly budget cap in numbers only (no currency symbol)      |
+| `CURRENCY_CODE`      | `USD` / `GBP` / `IDR`    | Must match billing account currency                          |
+| `GCHAT_WEBHOOK_URL`  | `https://chat.googleapis.com/v1/spaces/...` | Google Chat webhook for kill switch alerts (optional) |
+| `ALERT_EMAIL`        | `admin@example.com`       | Email for Cloud Monitoring alert when kill switch fires (optional) |
+
+> Collect and confirm all required variables with the user before proceeding to Step 2.
+
+---
 
 ## Steps
 
@@ -10,6 +28,7 @@ Ask the user for:
 - `PROJECT_ID` — GCP project to protect
 - `BILLING_ACCOUNT_ID` — billing account linked to the project (format: `XXXXXX-XXXXXX-XXXXXX`)
 - `REGION` — Cloud Run region (default: `asia-southeast2`)
+- `BUDGET_AMOUNT` — monthly budget cap (number only, e.g. `100`)
 - `CURRENCY_CODE` — billing account currency (default: `USD`; use `IDR` for Elitery/Indonesian accounts)
 - `GCHAT_WEBHOOK_URL` — Google Chat Space webhook URL (optional, press Enter to skip)
 - `ALERT_EMAIL` — email address for Cloud Monitoring notification (optional)
@@ -21,6 +40,7 @@ Confirm inputs with the user before proceeding.
 ```bash
 gcloud services enable \
   cloudbilling.googleapis.com \
+  billingbudgets.googleapis.com \
   pubsub.googleapis.com \
   run.googleapis.com \
   eventarc.googleapis.com \
@@ -311,11 +331,17 @@ gcloud billing projects link PROJECT_ID --billing-account=BILLING_ACCOUNT_ID
 
 **For standard billing accounts** — via CLI:
 ```bash
+ALL_SVC="services/C7E2-9256-1C43,services/AEFD-7695-64FA,services/719A-983F-202D,services/D73B-5EEA-8215,services/04C4-B046-D8B2,services/D870-408D-92A6,services/C08E-37B9-80D3,services/02DA-B362-D983,services/74B1-77CF-C302,services/63DE-82AB-F564,services/EDA4-10BF-88A3,services/FBC0-AA4A-C89A,services/1DB1-3CD3-35A3,services/8CD0-2A17-0B05,services/E5FE-878F-FECE,services/AF9A-5F4C-31E5"
+# 16 services: Vertex AI, Gemini API, Duet AI, Notebooks, Natural Language, Document AI,
+# Vision API, Text-to-Speech, Vertex AI Search, Speech API (STT), AutoML, Dialogflow,
+# Translation, Video Intelligence, Vertex AI Vision, Recommendations AI
+
 gcloud billing budgets create \
   --billing-account=BILLING_ACCOUNT_ID \
   --display-name="PROJECT_ID-killswitch-budget" \
   --filter-projects="projects/PROJECT_ID" \
-  --budget-amount=AMOUNTCURRENCY \
+  --filter-services="$ALL_SVC" \
+  --budget-amount=BUDGET_AMOUNTCURRENCY_CODE \
   --threshold-rule=percent=0.5 \
   --threshold-rule=percent=0.9 \
   --threshold-rule=percent=1.0 \
@@ -323,7 +349,50 @@ gcloud billing budgets create \
   --project=PROJECT_ID
 ```
 
-**For reseller sub-accounts (e.g. Elitery IDR)** — must use GCP Console:
+**For reseller sub-accounts (e.g. Elitery IDR)** — use REST API directly (gcloud CLI omits `schemaVersion` which causes `INVALID_ARGUMENT`):
+```bash
+TOKEN=$(gcloud auth print-access-token)
+PROJECT_NUMBER=$(gcloud projects describe PROJECT_ID --format="value(projectNumber)")
+
+curl -s -X POST \
+  "https://billingbudgets.googleapis.com/v1/billingAccounts/BILLING_ACCOUNT_ID/budgets" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -H "x-goog-user-project: PROJECT_ID" \
+  -d '{
+    "displayName": "PROJECT_ID-killswitch-budget",
+    "budgetFilter": {
+      "projects": ["projects/'"$PROJECT_NUMBER"'"],
+      "services": [
+        "services/C7E2-9256-1C43", "services/AEFD-7695-64FA", "services/719A-983F-202D",
+        "services/D73B-5EEA-8215", "services/04C4-B046-D8B2", "services/D870-408D-92A6",
+        "services/C08E-37B9-80D3", "services/02DA-B362-D983", "services/74B1-77CF-C302",
+        "services/63DE-82AB-F564", "services/EDA4-10BF-88A3", "services/FBC0-AA4A-C89A",
+        "services/1DB1-3CD3-35A3", "services/8CD0-2A17-0B05", "services/E5FE-878F-FECE",
+        "services/AF9A-5F4C-31E5"
+      ],
+      "creditTypesTreatment": "INCLUDE_ALL_CREDITS",
+      "calendarPeriod": "MONTH"
+    },
+    "amount": {"specifiedAmount": {"currencyCode": "CURRENCY_CODE", "units": "BUDGET_AMOUNT"}},
+    "thresholdRules": [
+      {"thresholdPercent": 0.5},
+      {"thresholdPercent": 0.9},
+      {"thresholdPercent": 1.0}
+    ],
+    "notificationsRule": {
+      "pubsubTopic": "projects/PROJECT_ID/topics/budget-alerts",
+      "schemaVersion": "1.0"
+    }
+  }'
+```
+
+> ⚠️ Two bugs in `gcloud billing budgets create` affect reseller accounts:
+> 1. The CLI never sends `schemaVersion: "1.0"` — the API rejects requests with `Invalid schema version: ""`
+> 2. Reseller sub-accounts require `projects/PROJECT_NUMBER` (numeric), not `projects/PROJECT_ID` (string)
+> Both must be fixed simultaneously; either one alone still fails.
+
+**If REST API also fails** — use GCP Console:
 1. Billing → Budgets & alerts → Edit/create budget
 2. Manage notifications → Connect Pub/Sub topic → `projects/PROJECT_ID/topics/budget-alerts`
 3. Ensure 100% threshold exists → Save
@@ -341,7 +410,8 @@ Print deployment summary table with all components and their status.
 | Cloud Run 503 / `Failed to find attribute 'app'` | Missing `Procfile` for functions-framework | Add `Procfile: web: functions-framework --target=kill_switch --signature-type=cloudevent` |
 | 403 on `updateBillingInfo` | SA missing `roles/billing.projectManager` at project level | `gcloud projects add-iam-policy-binding ... --role="roles/billing.projectManager"` |
 | 403 on `updateBillingInfo` (billing account) | SA missing `roles/billing.admin` at billing account level | `gcloud billing accounts add-iam-policy-binding ...` |
-| Budget CLI `INVALID_ARGUMENT` | Reseller sub-account (e.g. IDR) doesn't support budget API | Create budget via Console instead |
+| Budget CLI `INVALID_ARGUMENT: Invalid schema version: ""` | `gcloud` omits `schemaVersion: "1.0"` from `notificationsRule` | Use REST API with `"schemaVersion": "1.0"` explicitly |
+| Budget CLI `INVALID_ARGUMENT` on reseller account | Reseller sub-account requires project number, not project ID string | Use `projects/PROJECT_NUMBER` in `budgetFilter.projects` |
 | Email notification not received | Email channel not verified | Send verification code and call `:verify` endpoint |
 | Function not triggered | Eventarc trigger not yet active | Wait 2 minutes after trigger creation |
 | Billing not disabled after test | Wrong `GCP_PROJECT_ID` env var | Ensure it's Project ID string, not Project Number |
