@@ -396,6 +396,8 @@ Expected: budget shows `projects/PROJECT_ID/topics/budget-alerts` as the Pub/Sub
 
 ### 11. Connect Budget Alert to Pub/Sub
 
+> If `ALERT_EMAIL` was provided in Step 9, the `$CHANNEL` variable (Cloud Monitoring notification channel) should be included in the budget so threshold alerts (50%, 90%, 100%) also go directly to email — not just when the kill switch fires.
+
 **For standard billing accounts** — via CLI:
 ```bash
 ALL_SVC="services/C7E2-9256-1C43,services/AEFD-7695-64FA,services/719A-983F-202D,services/D73B-5EEA-8215,services/04C4-B046-D8B2,services/D870-408D-92A6,services/C08E-37B9-80D3,services/02DA-B362-D983,services/74B1-77CF-C302,services/63DE-82AB-F564,services/EDA4-10BF-88A3,services/FBC0-AA4A-C89A,services/1DB1-3CD3-35A3,services/8CD0-2A17-0B05,services/E5FE-878F-FECE,services/AF9A-5F4C-31E5"
@@ -403,6 +405,21 @@ ALL_SVC="services/C7E2-9256-1C43,services/AEFD-7695-64FA,services/719A-983F-202D
 # Vision API, Text-to-Speech, Vertex AI Search, Speech API (STT), AutoML, Dialogflow,
 # Translation, Video Intelligence, Vertex AI Vision, Recommendations AI
 
+# With email notification (ALERT_EMAIL was provided in Step 9):
+gcloud billing budgets create \
+  --billing-account=BILLING_ACCOUNT_ID \
+  --display-name="PROJECT_ID-killswitch-budget" \
+  --filter-projects="projects/PROJECT_ID" \
+  --filter-services="$ALL_SVC" \
+  --budget-amount=BUDGET_AMOUNTCURRENCY_CODE \
+  --threshold-rule=percent=0.5 \
+  --threshold-rule=percent=0.9 \
+  --threshold-rule=percent=1.0 \
+  --notifications-rule-pubsub-topic=projects/PROJECT_ID/topics/budget-alerts \
+  --all-updates-rule-monitoring-notification-channels=$CHANNEL \
+  --project=PROJECT_ID
+
+# Without email notification (ALERT_EMAIL not provided, omit the last flag):
 gcloud billing budgets create \
   --billing-account=BILLING_ACCOUNT_ID \
   --display-name="PROJECT_ID-killswitch-budget" \
@@ -421,6 +438,7 @@ gcloud billing budgets create \
 TOKEN=$(gcloud auth print-access-token)
 PROJECT_NUMBER=$(gcloud projects describe PROJECT_ID --format="value(projectNumber)")
 
+# With email notification (ALERT_EMAIL provided — include monitoringNotificationChannels):
 curl -s -X POST \
   "https://billingbudgets.googleapis.com/v1/billingAccounts/BILLING_ACCOUNT_ID/budgets" \
   -H "Authorization: Bearer $TOKEN" \
@@ -449,10 +467,15 @@ curl -s -X POST \
     ],
     "notificationsRule": {
       "pubsubTopic": "projects/PROJECT_ID/topics/budget-alerts",
-      "schemaVersion": "1.0"
+      "schemaVersion": "1.0",
+      "monitoringNotificationChannels": ["CHANNEL_FULL_NAME"]
     }
   }'
 ```
+
+> `CHANNEL_FULL_NAME` = full resource name from Step 9, e.g. `projects/PROJECT_ID/notificationChannels/CHANNEL_NUMERIC_ID`
+
+> Without email: omit the `"monitoringNotificationChannels"` field entirely.
 
 > ⚠️ Two bugs in `gcloud billing budgets create` affect reseller accounts:
 > 1. The CLI never sends `schemaVersion: "1.0"` — the API rejects requests with `Invalid schema version: ""`
@@ -462,7 +485,8 @@ curl -s -X POST \
 **If REST API also fails** — use GCP Console:
 1. Billing → Budgets & alerts → Edit/create budget
 2. Manage notifications → Connect Pub/Sub topic → `projects/PROJECT_ID/topics/budget-alerts`
-3. Ensure 100% threshold exists → Save
+3. Under "Manage email notifications" → add `ALERT_EMAIL`
+4. Ensure 100% threshold exists → Save
 
 ### 12. Final Summary
 
