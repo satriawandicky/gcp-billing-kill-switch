@@ -10,7 +10,7 @@ Deploy a serverless GCP billing kill switch. Automatically disables project bill
 |----------------------|---------------------------|--------------------------------------------------------------|
 | `PROJECT_ID`         | `my-project-prod`         | GCP project to protect (billing will be disabled on breach)  |
 | `BILLING_ACCOUNT_ID` | `01E24F-97C25D-DB772B`    | Billing account linked to the project                        |
-| `REGION`             | `asia-southeast2`         | Cloud Run deployment region (default: `us-central1`)         |
+| `REGION`             | `us-central1` / `asia-southeast2` | Cloud Run deployment region — auto-selected based on billing account currency (see Step 1) |
 | `BUDGET_AMOUNT`      | `100`                     | Monthly budget cap in numbers only (no currency symbol)      |
 | `CURRENCY_CODE`      | `USD` / `GBP` / `IDR`    | Must match billing account currency                          |
 | `GCHAT_WEBHOOK_URL`  | `https://chat.googleapis.com/v1/spaces/...` | Google Chat webhook for kill switch alerts (optional) |
@@ -27,13 +27,27 @@ Deploy a serverless GCP billing kill switch. Automatically disables project bill
 Ask the user for:
 - `PROJECT_ID` — GCP project to protect
 - `BILLING_ACCOUNT_ID` — billing account linked to the project (format: `XXXXXX-XXXXXX-XXXXXX`)
-- `REGION` — Cloud Run region (default: `asia-southeast2`)
 - `BUDGET_AMOUNT` — monthly budget cap (number only, e.g. `100`)
-- `CURRENCY_CODE` — billing account currency (default: `USD`; use `IDR` for Elitery/Indonesian accounts)
 - `GCHAT_WEBHOOK_URL` — Google Chat Space webhook URL (optional, press Enter to skip)
 - `ALERT_EMAIL` — email address for Cloud Monitoring notification (optional)
 
-Confirm inputs with the user before proceeding.
+**Auto-resolve `REGION` and `CURRENCY_CODE` from billing account:**
+
+```bash
+gcloud billing accounts describe BILLING_ACCOUNT_ID --format="value(currencyCode)"
+```
+
+Apply this mapping:
+| `CURRENCY_CODE` | Default `REGION` | Typical account |
+|---|---|---|
+| `IDR` | `asia-southeast2` | Elitery / Indonesian reseller |
+| `USD` | `us-central1` | WALT Labs LLC / standard |
+| `GBP` / `EUR` | `europe-west1` | WALT Labs EMEA |
+| other | ask user | — |
+
+Always show the resolved `REGION` and `CURRENCY_CODE` to the user for confirmation before proceeding.
+
+Confirm all inputs with the user before proceeding.
 
 ### 2. Enable Required APIs
 
