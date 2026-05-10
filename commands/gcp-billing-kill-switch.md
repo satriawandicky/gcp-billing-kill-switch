@@ -331,6 +331,16 @@ Confirm `verificationStatus: "VERIFIED"` in the response.
 
 ### 10. Test Kill Switch
 
+> ⚠️ **PRODUCTION WARNING**: This test **actually disables billing** and causes a full outage on the project. All running services (Cloud Run, VMs, GKE, Cloud SQL) will stop within minutes.
+>
+> **Ask the user explicitly before running this step:**
+> - Is this a sandbox/non-critical project?
+> - Are there any live workloads on this project right now?
+>
+> If the project is production or has live workloads, **skip to the non-destructive alternative below**.
+
+**Option A — Full test (sandbox only, causes real outage):**
+
 ```bash
 gcloud pubsub topics publish budget-alerts \
   --project=PROJECT_ID \
@@ -356,6 +366,33 @@ Restore billing after test:
 ```bash
 gcloud billing projects link PROJECT_ID --billing-account=BILLING_ACCOUNT_ID
 ```
+
+**Option B — Non-destructive verification (safe for production):**
+
+Verify the Cloud Run service is deployed and reachable (no trigger fired):
+```bash
+gcloud run services describe billing-kill-switch \
+  --region=REGION \
+  --project=PROJECT_ID \
+  --format="value(status.url,status.conditions[0].status)"
+```
+
+Verify the Eventarc trigger exists and is active:
+```bash
+gcloud eventarc triggers describe budget-kill-trigger \
+  --location=REGION \
+  --project=PROJECT_ID \
+  --format="value(name,transport.pubsub.subscription)"
+```
+
+Verify the budget is connected to Pub/Sub:
+```bash
+gcloud billing budgets list \
+  --billing-account=BILLING_ACCOUNT_ID \
+  --format="table(displayName,notificationsRule.pubsubTopic,amount.specifiedAmount.units)"
+```
+
+Expected: budget shows `projects/PROJECT_ID/topics/budget-alerts` as the Pub/Sub topic. This confirms the full chain is wired without triggering the kill switch.
 
 ### 11. Connect Budget Alert to Pub/Sub
 
