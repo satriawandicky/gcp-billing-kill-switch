@@ -16,6 +16,27 @@ Invoke in Claude Code:
 /gcp-billing-kill-switch
 ```
 
+Claude will prompt for the required variables below before proceeding.
+
+---
+
+## Required Variables
+
+| Variable | Example | Description |
+|---|---|---|
+| `PROJECT_ID` | `my-project-prod` | GCP project to protect (billing will be disabled on breach) |
+| `BILLING_ACCOUNT_ID` | `01E24F-97C25D-DB772B` | Billing account linked to the project (format: `XXXXXX-XXXXXX-XXXXXX`) |
+| `REGION` | `asia-southeast2` | Cloud Run deployment region (default: `asia-southeast2`) |
+| `BUDGET_AMOUNT` | `100` | Monthly budget cap — number only, no currency symbol |
+| `CURRENCY_CODE` | `IDR` / `USD` / `GBP` | Must match the billing account currency |
+
+### Optional Variables
+
+| Variable | Example | Description |
+|---|---|---|
+| `GCHAT_WEBHOOK_URL` | `https://chat.googleapis.com/v1/spaces/...` | Google Chat webhook for kill switch alerts |
+| `ALERT_EMAIL` | `admin@example.com` | Email for Cloud Monitoring alert when kill switch fires |
+
 ---
 
 ## Architecture
