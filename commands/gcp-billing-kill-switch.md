@@ -13,7 +13,8 @@ Deploy a serverless GCP billing kill switch. Automatically disables project bill
 | `REGION`             | `us-central1` / `asia-southeast2` | Cloud Run deployment region — auto-selected based on billing account currency (see Step 1) |
 | `BUDGET_AMOUNT`      | `100`                     | Monthly budget cap in numbers only (no currency symbol)      |
 | `CURRENCY_CODE`      | `USD` / `GBP` / `IDR`    | Must match billing account currency                          |
-| `GCHAT_WEBHOOK_URL`  | `https://chat.googleapis.com/v1/spaces/...` | Google Chat webhook for kill switch alerts (optional) |
+| `KILL_SWITCH_MODE`   | `sandbox` / `customer`    | `sandbox` (default) = auto-kill at 100% only. `customer` = 85% warning + pre-kill alert + auto-kill at 100%. Use `customer` for live customer-facing projects. |
+| `GCHAT_WEBHOOK_URL`  | `https://chat.googleapis.com/v1/spaces/...` *or* `https://hooks.slack.com/services/...` | Chat webhook for kill switch alerts. Google Chat *or* Slack — payload `{"text":"..."}` is compatible with both. Required if `KILL_SWITCH_MODE=customer`. |
 | `ALERT_EMAIL`        | `admin@example.com`       | Email for Cloud Monitoring alert when kill switch fires (optional) |
 
 > Collect and confirm all required variables with the user before proceeding to Step 2.
@@ -28,7 +29,8 @@ Ask the user for:
 - `PROJECT_ID` — GCP project to protect
 - `BILLING_ACCOUNT_ID` — billing account linked to the project (format: `XXXXXX-XXXXXX-XXXXXX`)
 - `BUDGET_AMOUNT` — monthly budget cap (number only, e.g. `100`)
-- `GCHAT_WEBHOOK_URL` — Google Chat Space webhook URL (optional, press Enter to skip)
+- `KILL_SWITCH_MODE` — `sandbox` (default, auto-kill at 100%) or `customer` (85% Slack warning + pre-kill alert + auto-kill at 100%). Use `customer` for live customer-facing projects.
+- `GCHAT_WEBHOOK_URL` — Google Chat OR Slack incoming webhook URL (optional for `sandbox`, **required** for `customer`)
 - `ALERT_EMAIL` — email address for Cloud Monitoring notification (optional)
 
 **Auto-resolve `REGION` and `CURRENCY_CODE` from billing account:**
@@ -83,6 +85,9 @@ gcloud services enable \
 
 ### 3. Create Dedicated Service Account
 
+> ⚠️ **ONE SERVICE ACCOUNT PER PROJECT — DO NOT REUSE ACROSS PROJECTS.**
+> The skill creates `billing-killswitch-sa@${PROJECT_ID}.iam.gserviceaccount.com` fresh for each project. Never override `--service-account` with an SA from a different project (e.g. don't reuse `stewart-sandbox` SA for `walt-manager-copilot`). Cross-project SA = blast radius leak: one compromised project can disable billing on every project the shared SA has access to.
+
 ```bash
 gcloud iam service-accounts create billing-killswitch-sa \
   --display-name="Billing Kill Switch SA" \
@@ -118,13 +123,48 @@ gcloud billing accounts add-iam-policy-binding BILLING_ACCOUNT_ID \
 gcloud pubsub topics create budget-alerts --project=PROJECT_ID
 ```
 
+### 4b. Create Dead-Letter Topic + IAM
+
+Eventarc's auto-created subscription has no DLQ by default — if Cloud Run keeps returning non-2xx (cold-start timeout, IAM drift, quota exceeded), the budget alert message is **silently dropped after 5 retries** and the kill switch never fires.
+
+Create DLQ topic:
+```bash
+gcloud pubsub topics create budget-alerts-dlq --project=PROJECT_ID
+```
+
+Grant the Pub/Sub service agent permission to publish to the DLQ and ack on the source subscription:
+```bash
+PROJECT_NUMBER=$(gcloud projects describe PROJECT_ID --format='value(projectNumber)')
+PUBSUB_SA="service-${PROJECT_NUMBER}@gcp-sa-pubsub.iam.gserviceaccount.com"
+
+gcloud pubsub topics add-iam-policy-binding budget-alerts-dlq \
+  --member="serviceAccount:${PUBSUB_SA}" \
+  --role="roles/pubsub.publisher" \
+  --project=PROJECT_ID
+
+gcloud pubsub topics add-iam-policy-binding budget-alerts \
+  --member="serviceAccount:${PUBSUB_SA}" \
+  --role="roles/pubsub.subscriber" \
+  --project=PROJECT_ID
+```
+
+Create a pull subscription on the DLQ — needed to expose `oldest_unacked_message_age` metric for the alert in Step 8b:
+```bash
+gcloud pubsub subscriptions create budget-alerts-dlq-sub \
+  --topic=budget-alerts-dlq \
+  --message-retention-duration=7d \
+  --project=PROJECT_ID
+```
+
+> A message landing in DLQ = the kill switch failed to process a budget alert. Step 8b alerts on this within ~5 min.
+
 ### 5. Write Source Code
 
 ```bash
 mkdir -p /tmp/kill-switch-deploy
 ```
 
-Write `/tmp/kill-switch-deploy/main.py`:
+Write `/tmp/kill-switch-deploy/main.py` (copy verbatim from [`source/main.py`](../source/main.py)):
 ```python
 import base64
 import json
@@ -133,8 +173,11 @@ import urllib.request
 import functions_framework
 from google.cloud import billing_v1
 
-PROJECT_ID    = os.environ.get('GCP_PROJECT_ID')
-GCHAT_WEBHOOK = os.environ.get('GCHAT_WEBHOOK_URL', '')
+PROJECT_ID       = os.environ.get('GCP_PROJECT_ID')
+GCHAT_WEBHOOK    = os.environ.get('GCHAT_WEBHOOK_URL', '')
+KILL_SWITCH_MODE = os.environ.get('KILL_SWITCH_MODE', 'sandbox').lower()
+WARN_THRESHOLD   = 0.85  # fire warning between 85% and 100%
+
 
 @functions_framework.cloud_event
 def kill_switch(cloud_event):
@@ -148,12 +191,36 @@ def kill_switch(cloud_event):
     budget_amount = msg.get('budgetAmount', 0)
     currency      = msg.get('currencyCode', 'USD')
     budget_name   = msg.get('budgetDisplayName', 'unknown')
+    ratio         = (cost_amount / budget_amount) if budget_amount else 0
 
-    print(f'Budget check: {cost_amount}/{budget_amount} {currency}')
+    print(f'Budget check: {cost_amount}/{budget_amount} {currency} ({ratio:.0%}) mode={KILL_SWITCH_MODE}')
 
-    if cost_amount < budget_amount:
+    if ratio < WARN_THRESHOLD:
         print('Budget OK, no action needed.')
         return
+
+    if ratio < 1.0:
+        warn_msg = (
+            f"BUDGET WARNING ({ratio:.0%})\n"
+            f"Budget '{budget_name}': {cost_amount}/{budget_amount} {currency}\n"
+            f"Project: {PROJECT_ID} (mode={KILL_SWITCH_MODE})"
+        )
+        print(json.dumps({
+            'severity': 'WARNING', 'message': warn_msg,
+            'project_id': PROJECT_ID, 'budget_name': budget_name,
+            'ratio': ratio, 'cost_amount': cost_amount,
+            'budget_amount': budget_amount, 'currency': currency,
+        }))
+        _notify_webhook(warn_msg, level='warning')
+        return
+
+    # ratio >= 1.0 — kill switch fires
+    if KILL_SWITCH_MODE == 'customer':
+        _notify_webhook(
+            f"AUTO-KILL IMMINENT for {PROJECT_ID} "
+            f"(cost {cost_amount} >= budget {budget_amount} {currency})",
+            level='critical',
+        )
 
     client = billing_v1.CloudBillingClient()
     try:
@@ -168,29 +235,25 @@ def kill_switch(cloud_event):
             f"Budget '{budget_name}': {cost_amount} >= {budget_amount} {currency}\n"
             f'Billing DISABLED for: {PROJECT_ID}'
         )
-        # Structured log — triggers Cloud Monitoring alert
         print(json.dumps({
-            'severity': 'CRITICAL',
-            'message': alert_msg,
-            'project_id': PROJECT_ID,
-            'budget_name': budget_name,
-            'cost_amount': cost_amount,
-            'budget_amount': budget_amount,
+            'severity': 'CRITICAL', 'message': alert_msg,
+            'project_id': PROJECT_ID, 'budget_name': budget_name,
+            'cost_amount': cost_amount, 'budget_amount': budget_amount,
             'currency': currency,
         }))
-        _notify_gchat(alert_msg)
+        _notify_webhook(alert_msg, level='critical')
 
     except Exception as e:
         print(json.dumps({'severity': 'ERROR', 'message': f'ERROR disabling billing: {e}'}))
         raise
 
 
-def _notify_gchat(text: str):
+def _notify_webhook(text: str, level: str = 'critical'):
+    """POST {text} to GCHAT_WEBHOOK_URL. Compatible with Google Chat AND Slack."""
     if not GCHAT_WEBHOOK:
         return
-    payload = json.dumps({
-        'text': f'🚨 *GCP Billing Kill Switch Triggered*\n```{text}```'
-    })
+    prefix = {'warning': '🟡 *Budget Warning*', 'critical': '🔴 *Kill Switch*'}.get(level, '🔴 *Kill Switch*')
+    payload = json.dumps({'text': f'{prefix}\n```{text}```'})
     req = urllib.request.Request(
         GCHAT_WEBHOOK,
         data=payload.encode(),
@@ -213,7 +276,15 @@ web: functions-framework --target=kill_switch --signature-type=cloudevent
 
 > ⚠️ The `Procfile` is required. Without it, Cloud Run Buildpacks will try to find a `app` object in `main.py` and fail with 503.
 
-### 6. Store Google Chat Webhook (if provided)
+### 6. Store Chat Webhook (Google Chat or Slack)
+
+The secret name (`gchat-killswitch-webhook`) and env var (`GCHAT_WEBHOOK_URL`) are historical — the value can be **either**:
+- Google Chat incoming webhook (`https://chat.googleapis.com/v1/spaces/...`)
+- Slack incoming webhook (`https://hooks.slack.com/services/...`)
+
+Both accept identical `{"text": "..."}` payload. Choose whichever channel your team monitors.
+
+For P1 rollout: use Slack webhook from `#sre-killswitch-p1` channel.
 
 ```bash
 echo -n 'GCHAT_WEBHOOK_URL' | \
@@ -227,15 +298,29 @@ gcloud secrets add-iam-policy-binding gchat-killswitch-webhook \
   --project=PROJECT_ID
 ```
 
+To swap an existing secret value (Chat → Slack) without redeploying:
+```bash
+echo -n 'NEW_WEBHOOK_URL' | \
+  gcloud secrets versions add gchat-killswitch-webhook \
+  --data-file=- \
+  --project=PROJECT_ID
+# Cloud Run picks up :latest on next cold start — restart the service to apply immediately:
+gcloud run services update billing-kill-switch --region=REGION --project=PROJECT_ID
+```
+
 ### 7. Deploy Cloud Run Function
 
-With Google Chat:
+**Choose `KILL_SWITCH_MODE`:**
+- `sandbox` (default) — auto-kill at 100%, no pre-warning. Use for non-customer-facing projects.
+- `customer` — emits Slack/Chat warning at 85–99% (no billing action), additional pre-kill alert at 100%, then auto-kills. Use for live customer projects (`walt-manager-copilot`, `wl-agentspace`, `walt-legal-companion`).
+
+With Chat/Slack webhook:
 ```bash
 gcloud run deploy billing-kill-switch \
   --source=/tmp/kill-switch-deploy \
   --region=REGION \
   --service-account=billing-killswitch-sa@PROJECT_ID.iam.gserviceaccount.com \
-  --set-env-vars=GCP_PROJECT_ID=PROJECT_ID \
+  --set-env-vars=GCP_PROJECT_ID=PROJECT_ID,KILL_SWITCH_MODE=KILL_SWITCH_MODE \
   --set-secrets=GCHAT_WEBHOOK_URL=gchat-killswitch-webhook:latest \
   --no-allow-unauthenticated \
   --max-instances=3 \
@@ -243,18 +328,20 @@ gcloud run deploy billing-kill-switch \
   --project=PROJECT_ID
 ```
 
-Without Google Chat:
+Without webhook:
 ```bash
 gcloud run deploy billing-kill-switch \
   --source=/tmp/kill-switch-deploy \
   --region=REGION \
   --service-account=billing-killswitch-sa@PROJECT_ID.iam.gserviceaccount.com \
-  --set-env-vars=GCP_PROJECT_ID=PROJECT_ID \
+  --set-env-vars=GCP_PROJECT_ID=PROJECT_ID,KILL_SWITCH_MODE=KILL_SWITCH_MODE \
   --no-allow-unauthenticated \
   --max-instances=3 \
   --timeout=60 \
   --project=PROJECT_ID
 ```
+
+> ⚠️ `customer` mode without a webhook is useless — the 85% warning has nowhere to go. If `KILL_SWITCH_MODE=customer`, `GCHAT_WEBHOOK_URL` MUST be set.
 
 ### 8. Create Eventarc Trigger
 
@@ -270,6 +357,79 @@ gcloud eventarc triggers create budget-kill-trigger \
 ```
 
 Wait 2 minutes for trigger to become active before testing.
+
+**Attach DLQ + retry policy to the Eventarc-managed subscription.** Eventarc creates the push subscription itself (auto-named `eventarc-REGION-budget-kill-trigger-sub-NNN`), so DLQ flags can only be set post-create:
+
+```bash
+# Wait for Eventarc to create the subscription
+sleep 60
+
+# Discover the auto-created subscription name (it pushes to Cloud Run)
+SUB_NAME=$(gcloud pubsub subscriptions list \
+  --filter="topic:projects/PROJECT_ID/topics/budget-alerts" \
+  --format="value(name)" \
+  --project=PROJECT_ID | head -1)
+
+echo "Eventarc subscription: ${SUB_NAME}"
+
+# Attach DLQ + retry policy
+gcloud pubsub subscriptions update "${SUB_NAME}" \
+  --dead-letter-topic=budget-alerts-dlq \
+  --max-delivery-attempts=5 \
+  --min-retry-delay=10s \
+  --max-retry-delay=600s \
+  --project=PROJECT_ID
+```
+
+Verify:
+```bash
+gcloud pubsub subscriptions describe "${SUB_NAME}" \
+  --project=PROJECT_ID \
+  --format="value(deadLetterPolicy.deadLetterTopic,deadLetterPolicy.maxDeliveryAttempts,retryPolicy.minimumBackoff,retryPolicy.maximumBackoff)"
+```
+
+Expected: `projects/PROJECT_ID/topics/budget-alerts-dlq	5	10s	600s`
+
+### 8b. Setup DLQ Age Alert (P1 rollout requirement)
+
+If a budget message lands in the DLQ, the kill switch failed silently. Alert on `oldest_unacked_message_age` on the DLQ subscription so we know within 5 minutes.
+
+Requires Slack/Chat notification channel from Step 9 (`$SLACK_CHANNEL` or `$CHANNEL`). If neither set, skip and configure manually later.
+
+```bash
+# Pick whichever channel exists from Step 9 (email or webhook)
+ALERT_CHANNEL="${SLACK_CHANNEL:-$CHANNEL}"
+
+cat > /tmp/dlq-age-alert.json <<EOF
+{
+  "displayName": "Kill Switch DLQ — message stuck",
+  "documentation": {
+    "content": "A budget alert message landed in budget-alerts-dlq. This means the kill switch Cloud Run service failed to process it after 5 retries. Investigate: Cloud Run logs for billing-kill-switch, IAM on billing-killswitch-sa, billing.googleapis.com quota.",
+    "mimeType": "text/markdown"
+  },
+  "conditions": [{
+    "displayName": "DLQ message age > 5 min",
+    "conditionThreshold": {
+      "filter": "resource.type=\"pubsub_subscription\" AND resource.labels.subscription_id=\"budget-alerts-dlq-sub\" AND metric.type=\"pubsub.googleapis.com/subscription/oldest_unacked_message_age\"",
+      "comparison": "COMPARISON_GT",
+      "thresholdValue": 300,
+      "duration": "60s",
+      "aggregations": [{"alignmentPeriod": "60s", "perSeriesAligner": "ALIGN_MAX"}]
+    }
+  }],
+  "alertStrategy": {"autoClose": "604800s"},
+  "notificationChannels": ["${ALERT_CHANNEL}"],
+  "combiner": "OR",
+  "enabled": true
+}
+EOF
+
+gcloud alpha monitoring policies create \
+  --policy-from-file=/tmp/dlq-age-alert.json \
+  --project=PROJECT_ID
+```
+
+> Test the DLQ path post-deploy: publish a malformed message (e.g. `{"costAmount":"not-a-number"}`) to `budget-alerts`. After 5 failed deliveries (~5 min), the message lands in DLQ and the alert fires.
 
 ### 9. Setup Cloud Monitoring Email Alert (if email provided)
 
