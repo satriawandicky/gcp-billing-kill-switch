@@ -13,8 +13,8 @@ Deploy a serverless GCP billing kill switch. Automatically disables project bill
 | `REGION`             | `us-central1` / `asia-southeast2` | Cloud Run deployment region — auto-selected based on billing account currency (see Step 1) |
 | `BUDGET_AMOUNT`      | `100`                     | Monthly budget cap in numbers only (no currency symbol)      |
 | `CURRENCY_CODE`      | `USD` / `GBP` / `IDR`    | Must match billing account currency                          |
-| `KILL_SWITCH_MODE`   | `sandbox` / `customer`    | `sandbox` (default) = auto-kill at 100% only. `customer` = 85% warning + pre-kill alert + auto-kill at 100%. Use `customer` for live customer-facing projects. |
-| `GCHAT_WEBHOOK_URL`  | `https://chat.googleapis.com/v1/spaces/...` *or* `https://hooks.slack.com/services/...` | Chat webhook for kill switch alerts. Google Chat *or* Slack — payload `{"text":"..."}` is compatible with both. Required if `KILL_SWITCH_MODE=customer`. |
+| `KILL_SWITCH_MODE`   | `sandbox` / `customer`    | Both modes warn at 85–99% (no billing change) and kill at 100%. `customer` adds a pre-kill imminent webhook moments before the 100% kill call fires. |
+| `GCHAT_WEBHOOK_URL`  | `https://chat.googleapis.com/v1/spaces/...` *or* `https://hooks.slack.com/services/...` | Chat webhook for warnings + kill alerts. Google Chat *or* Slack — payload `{"text":"..."}` works on both. Strongly recommended. |
 | `ALERT_EMAIL`        | `admin@example.com`       | Email for Cloud Monitoring alert when kill switch fires (optional) |
 
 > Collect and confirm all required variables with the user before proceeding to Step 2.
@@ -29,8 +29,8 @@ Ask the user for:
 - `PROJECT_ID` — GCP project to protect
 - `BILLING_ACCOUNT_ID` — billing account linked to the project (format: `XXXXXX-XXXXXX-XXXXXX`)
 - `BUDGET_AMOUNT` — monthly budget cap (number only, e.g. `100`)
-- `KILL_SWITCH_MODE` — `sandbox` (default, auto-kill at 100%) or `customer` (85% Slack warning + pre-kill alert + auto-kill at 100%). Use `customer` for live customer-facing projects.
-- `GCHAT_WEBHOOK_URL` — Google Chat OR Slack incoming webhook URL (optional for `sandbox`, **required** for `customer`)
+- `KILL_SWITCH_MODE` — `sandbox` (default) or `customer`. Both warn at 85–99% and kill at 100%; `customer` adds a pre-kill imminent webhook before the 100% kill call.
+- `GCHAT_WEBHOOK_URL` — Google Chat OR Slack incoming webhook URL (strongly recommended in both modes — without it, warnings only go to Cloud Logging)
 - `ALERT_EMAIL` — email address for Cloud Monitoring notification (optional)
 
 **Auto-resolve `REGION` and `CURRENCY_CODE` from billing account:**
@@ -311,8 +311,11 @@ gcloud run services update billing-kill-switch --region=REGION --project=PROJECT
 ### 7. Deploy Cloud Run Function
 
 **Choose `KILL_SWITCH_MODE`:**
-- `sandbox` (default) — auto-kill at 100%, no pre-warning. Use for non-customer-facing projects.
-- `customer` — emits Slack/Chat warning at 85–99% (no billing action), additional pre-kill alert at 100%, then auto-kills. Use for live customer projects (`walt-manager-copilot`, `wl-agentspace`, `walt-legal-companion`).
+
+Both modes emit a warning at 85–99% (no billing change) and disable billing at 100%. The difference: `customer` adds one extra "AUTO-KILL IMMINENT" webhook moments before the 100% kill call.
+
+- `sandbox` (default) — 85–99% warning, 100% kill (no pre-kill alert). Use for non-customer-facing projects.
+- `customer` — 85–99% warning, 100% pre-kill imminent webhook → kill. Use for live customer projects.
 
 With Chat/Slack webhook:
 ```bash
@@ -341,7 +344,7 @@ gcloud run deploy billing-kill-switch \
   --project=PROJECT_ID
 ```
 
-> ⚠️ `customer` mode without a webhook is useless — the 85% warning has nowhere to go. If `KILL_SWITCH_MODE=customer`, `GCHAT_WEBHOOK_URL` MUST be set.
+> ⚠️ Without a webhook, warnings only land in Cloud Logging — nobody gets paged. Strongly recommended for both modes.
 
 ### 8. Create Eventarc Trigger
 

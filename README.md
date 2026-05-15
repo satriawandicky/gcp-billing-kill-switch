@@ -2,9 +2,15 @@
 
 Claude Code skill to deploy a serverless GCP billing kill switch. Automatically disables project billing when a 100% budget alert fires. Uses Pub/Sub + Eventarc + Cloud Run Gen2.
 
-Two deploy modes:
-- **`sandbox`** (default) — auto-kill at 100% only. Use for non-customer-facing projects.
-- **`customer`** — 85% Slack/Chat warning → pre-kill alert at 100% → auto-kill. Use for live customer projects.
+Two deploy modes — both warn at 85–99% and disable billing at 100%. The only difference is one extra pre-kill notification:
+
+| Ratio | `sandbox` (default) | `customer` |
+|---|---|---|
+| `< 85%` | no-op | no-op |
+| `85–99%` | 🟡 Warning webhook + log (billing **untouched**) | 🟡 Warning webhook + log (billing **untouched**) |
+| `≥ 100%` | 🔴 Disable billing + critical webhook | 🔴 Pre-kill "AUTO-KILL IMMINENT" webhook → disable billing + critical webhook |
+
+Both modes **never cut billing below 100%**. Pick `customer` for live customer-facing projects where you want a heads-up alert moments before the kill API call fires; pick `sandbox` (default) elsewhere.
 
 Includes a dead-letter topic on the Eventarc subscription and an age alert so silent failures of the kill switch itself page someone within ~5 min.
 
@@ -40,8 +46,8 @@ Claude will prompt for the required variables below before proceeding.
 
 | Variable | Example | Description |
 |---|---|---|
-| `KILL_SWITCH_MODE` | `sandbox` / `customer` | `sandbox` (default) = auto-kill at 100% only. `customer` = 85% warning + pre-kill alert + auto-kill at 100%. Webhook required for `customer`. |
-| `GCHAT_WEBHOOK_URL` | `https://chat.googleapis.com/v1/spaces/...` *or* `https://hooks.slack.com/services/...` | Chat webhook for alerts. Google Chat **or** Slack — payload is compatible with both. Required when `KILL_SWITCH_MODE=customer`. |
+| `KILL_SWITCH_MODE` | `sandbox` / `customer` | Both modes warn at 85–99% (no billing change) and kill at 100%. `customer` adds a pre-kill imminent webhook moments before the 100% kill API call fires. Webhook required to receive warnings. |
+| `GCHAT_WEBHOOK_URL` | `https://chat.googleapis.com/v1/spaces/...` *or* `https://hooks.slack.com/services/...` | Chat webhook for warnings + kill alerts. Google Chat **or** Slack — payload is compatible with both. Strongly recommended (without it, warnings only go to Cloud Logging). |
 | `ALERT_EMAIL` | `admin@example.com` | Email for Cloud Monitoring alert when kill switch fires |
 
 ---
