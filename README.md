@@ -2,15 +2,17 @@
 
 Claude Code skill to deploy a serverless GCP billing kill switch. Automatically disables project billing when a 100% budget alert fires. Uses Pub/Sub + Eventarc + Cloud Run Gen2.
 
-Two deploy modes — both warn at 85–99% and disable billing at 100%. The only difference is one extra pre-kill notification:
+Two deploy modes — both warn at 90–99% and disable billing at 100%. The only difference is one extra pre-kill notification:
 
 | Ratio | `sandbox` (default) | `customer` |
 |---|---|---|
-| `< 85%` | no-op | no-op |
-| `85–99%` | 🟡 Warning webhook + log (billing **untouched**) | 🟡 Warning webhook + log (billing **untouched**) |
+| `< 90%` | no-op | no-op |
+| `90–99%` | 🟡 Warning webhook + log (billing **untouched**) | 🟡 Warning webhook + log (billing **untouched**) |
 | `≥ 100%` | 🔴 Disable billing + critical webhook | 🔴 Pre-kill "AUTO-KILL IMMINENT" webhook → disable billing + critical webhook |
 
 Both modes **never cut billing below 100%**. Pick `customer` for live customer-facing projects where you want a heads-up alert moments before the kill API call fires; pick `sandbox` (default) elsewhere.
+
+Alerts fan out to **Google Chat and Slack in parallel** — both webhook URLs are optional; setting one, the other, or both is supported. Each channel POST has its own error isolation so one broken channel never blocks the other.
 
 Includes a dead-letter topic on the Eventarc subscription and an age alert so silent failures of the kill switch itself page someone within ~5 min.
 
@@ -46,9 +48,12 @@ Claude will prompt for the required variables below before proceeding.
 
 | Variable | Example | Description |
 |---|---|---|
-| `KILL_SWITCH_MODE` | `sandbox` / `customer` | Both modes warn at 85–99% (no billing change) and kill at 100%. `customer` adds a pre-kill imminent webhook moments before the 100% kill API call fires. Webhook required to receive warnings. |
-| `GCHAT_WEBHOOK_URL` | `https://chat.googleapis.com/v1/spaces/...` *or* `https://hooks.slack.com/services/...` | Chat webhook for warnings + kill alerts. Google Chat **or** Slack — payload is compatible with both. Strongly recommended (without it, warnings only go to Cloud Logging). |
+| `KILL_SWITCH_MODE` | `sandbox` / `customer` | Both modes warn at 90–99% (no billing change) and kill at 100%. `customer` adds a pre-kill imminent webhook moments before the 100% kill API call fires. Webhook required to receive warnings. |
+| `GCHAT_WEBHOOK_URL` | `https://chat.googleapis.com/v1/spaces/...` | Google Chat incoming webhook for warnings + kill alerts. Optional. |
+| `SLACK_WEBHOOK_URL` | `https://hooks.slack.com/services/...` | Slack incoming webhook for warnings + kill alerts. Optional. Set alongside `GCHAT_WEBHOOK_URL` to fan out to both. |
 | `ALERT_EMAIL` | `admin@example.com` | Email for Cloud Monitoring alert when kill switch fires |
+
+> At least one webhook is strongly recommended — without either, warnings + kill alerts only land in Cloud Logging.
 
 ---
 
@@ -78,7 +83,8 @@ flowchart TD
     end
 
     subgraph NOTIFICATIONS ["Notifications"]
-        F[💬 Chat/Slack Webhook\nGCHAT_WEBHOOK_URL]
+        FG[💬 Google Chat Webhook\nGCHAT_WEBHOOK_URL]
+        FS[💬 Slack Webhook\nSLACK_WEBHOOK_URL]
         G[📧 Cloud Monitoring\nEmail Alert]
         DLQA[🚨 DLQ Age Alert\n>5 min unacked]
         H[📋 Cloud Logging\nAudit Trail]
@@ -94,15 +100,18 @@ flowchart TD
     D -->|after 5 fails| DLQ
     DLQ --> DLQSUB
     DLQSUB -->|oldest_unacked_message_age| DLQA
-    DLQA --> F
+    DLQA --> FG
+    DLQA --> FS
     E --> E0
-    E0 -->|< 85%| Z([✅ No action])
-    E0 -->|85–99% customer mode| EW
-    EW --> F
+    E0 -->|< 90%| Z([✅ No action])
+    E0 -->|90–99%| EW
+    EW --> FG
+    EW --> FS
     E0 -->|>= 100%| E2
     E2 --> E3
     E2 -->|unlink billing account| I
-    E2 -->|webhook POST| F
+    E2 -->|webhook POST| FG
+    E2 -->|webhook POST| FS
     E3 -->|log ingestion| H
     H -->|log-based alert| G
 
@@ -127,10 +136,11 @@ flowchart TD
 | 5 | Eventarc Trigger | `budget-kill-trigger` | Routes Pub/Sub → Cloud Run (5 retries, DLQ on fail) |
 | 6 | Cloud Run Function | Python 3.12, Gen2 | Kill switch logic with `sandbox`/`customer` modes |
 | 7 | Cloud Billing API | `updateProjectBillingInfo` | Unlinks billing from project |
-| 8 | Chat/Slack Webhook | Incoming Webhook | Warnings + kill alerts (Google Chat or Slack) |
-| 9 | Cloud Monitoring | Log-based + DLQ age alerts | Email on trigger, page on DLQ stuck |
-| 10 | Secret Manager | `gchat-killswitch-webhook` | Stores webhook URL securely |
-| 11 | Cloud Logging | Structured JSON logs | Full audit trail |
+| 8 | Google Chat Webhook | Incoming Webhook | Warnings + kill alerts to a Chat space |
+| 9 | Slack Webhook | Incoming Webhook | Warnings + kill alerts to a Slack channel — fires in parallel with Chat |
+| 10 | Cloud Monitoring | Log-based + DLQ age alerts | Email on trigger, page on DLQ stuck |
+| 11 | Secret Manager | `gchat-killswitch-webhook` + `slack-killswitch-webhook` | Stores webhook URLs securely (one secret per channel) |
+| 12 | Cloud Logging | Structured JSON logs | Full audit trail (incl. per-channel `notify_{gchat,slack} ok/failed` status) |
 
 ## What the Skill Does (Fully Automated)
 
@@ -140,7 +150,7 @@ flowchart TD
 4. Writes and deploys Cloud Run Function (Python 3.12, Gen2) with chosen `KILL_SWITCH_MODE`
 5. Creates Eventarc trigger and attaches DLQ + retry policy to the managed subscription
 6. Creates DLQ age alert (pages on stuck messages = silent kill switch failure)
-7. Stores Chat/Slack webhook in Secret Manager
+7. Stores webhooks in Secret Manager (`gchat-killswitch-webhook` for Google Chat, `slack-killswitch-webhook` for Slack — either or both)
 8. Sets up Cloud Monitoring email alert
 9. Runs end-to-end test and restores billing after test
 
@@ -151,7 +161,7 @@ flowchart TD
 ## Source Code
 
 See [`source/`](./source/) for the Cloud Run function files:
-- `main.py` — kill switch logic with `sandbox` / `customer` modes, 85% warning branch, Chat/Slack webhook + structured logging
+- `main.py` — kill switch logic with `sandbox` / `customer` modes, 90% warning branch, dual-channel (Google Chat + Slack) webhook fanout with per-channel error isolation, structured logging
 - `requirements.txt` — Python dependencies
 - `Procfile` — Cloud Run entry point (required for functions-framework)
 
@@ -176,15 +186,25 @@ See [`source/`](./source/) for the Cloud Run function files:
 
 ## Notifications
 
-### Chat/Slack Webhook (Opsi 1)
-Webhook stored in Secret Manager (`gchat-killswitch-webhook`) → injected as env var `GCHAT_WEBHOOK_URL`.
-Value can be **Google Chat** or **Slack** incoming webhook — both accept `{"text": "..."}` payload.
-- In `customer` mode: warning fires at 85–99%, pre-kill alert at 100%, kill confirmation after billing disabled.
-- In `sandbox` mode: only the kill confirmation fires (at 100%).
+### Chat/Slack Webhooks (Opsi 1)
+Two secrets, two env vars — each channel is independent:
 
-Swap the secret value without redeploying:
+| Secret | Env Var | Payload |
+|---|---|---|
+| `gchat-killswitch-webhook` | `GCHAT_WEBHOOK_URL` | `{"text": "..."}` to a Google Chat space |
+| `slack-killswitch-webhook` | `SLACK_WEBHOOK_URL` | `{"text": "..."}` to a Slack channel |
+
+Both accept the same payload shape. Set one, the other, or both — the function fans out to whichever URLs are configured. Per-channel `try/except` means a 4xx or timeout on one channel is logged but never blocks the other; each POST emits `notify_{gchat,slack} ok status=...` or `failed: ...` for observability.
+
+Behavior across modes:
+- Both `sandbox` and `customer`: 🟡 warning fires at 90–99% (no billing change), 🔴 kill confirmation fires at 100% after billing is disabled.
+- `customer` only: an extra 🔴 "AUTO-KILL IMMINENT" pre-kill webhook fires at 100% **before** the Cloud Billing API call — so the team has a heads-up even if the disable call hangs.
+
+Swap a secret value without redeploying:
 ```bash
 echo -n 'NEW_URL' | gcloud secrets versions add gchat-killswitch-webhook --data-file=- --project=PROJECT_ID
+# or the Slack secret:
+echo -n 'NEW_URL' | gcloud secrets versions add slack-killswitch-webhook --data-file=- --project=PROJECT_ID
 gcloud run services update billing-kill-switch --region=REGION --project=PROJECT_ID
 ```
 

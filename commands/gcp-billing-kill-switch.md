@@ -13,8 +13,9 @@ Deploy a serverless GCP billing kill switch. Automatically disables project bill
 | `REGION`             | `us-central1` / `asia-southeast2` | Cloud Run deployment region — auto-selected based on billing account currency (see Step 1) |
 | `BUDGET_AMOUNT`      | `100`                     | Monthly budget cap in numbers only (no currency symbol)      |
 | `CURRENCY_CODE`      | `USD` / `GBP` / `IDR`    | Must match billing account currency                          |
-| `KILL_SWITCH_MODE`   | `sandbox` / `customer`    | Both modes warn at 85–99% (no billing change) and kill at 100%. `customer` adds a pre-kill imminent webhook moments before the 100% kill call fires. |
-| `GCHAT_WEBHOOK_URL`  | `https://chat.googleapis.com/v1/spaces/...` *or* `https://hooks.slack.com/services/...` | Chat webhook for warnings + kill alerts. Google Chat *or* Slack — payload `{"text":"..."}` works on both. Strongly recommended. |
+| `KILL_SWITCH_MODE`   | `sandbox` / `customer`    | Both modes warn at 90–99% (no billing change) and kill at 100%. `customer` adds a pre-kill imminent webhook moments before the 100% kill call fires. |
+| `GCHAT_WEBHOOK_URL`  | `https://chat.googleapis.com/v1/spaces/...` | Google Chat incoming webhook for warnings + kill alerts. Optional. |
+| `SLACK_WEBHOOK_URL`  | `https://hooks.slack.com/services/...` | Slack incoming webhook for warnings + kill alerts. Optional. Set alongside `GCHAT_WEBHOOK_URL` to fan out to both channels in parallel. |
 | `ALERT_EMAIL`        | `admin@example.com`       | Email for Cloud Monitoring alert when kill switch fires (optional) |
 
 > Collect and confirm all required variables with the user before proceeding to Step 2.
@@ -29,8 +30,9 @@ Ask the user for:
 - `PROJECT_ID` — GCP project to protect
 - `BILLING_ACCOUNT_ID` — billing account linked to the project (format: `XXXXXX-XXXXXX-XXXXXX`)
 - `BUDGET_AMOUNT` — monthly budget cap (number only, e.g. `100`)
-- `KILL_SWITCH_MODE` — `sandbox` (default) or `customer`. Both warn at 85–99% and kill at 100%; `customer` adds a pre-kill imminent webhook before the 100% kill call.
-- `GCHAT_WEBHOOK_URL` — Google Chat OR Slack incoming webhook URL (strongly recommended in both modes — without it, warnings only go to Cloud Logging)
+- `KILL_SWITCH_MODE` — `sandbox` (default) or `customer`. Both warn at 90–99% and kill at 100%; `customer` adds a pre-kill imminent webhook before the 100% kill call.
+- `GCHAT_WEBHOOK_URL` — Google Chat incoming webhook URL (optional)
+- `SLACK_WEBHOOK_URL` — Slack incoming webhook URL (optional). At least one webhook (Chat or Slack — or both) is strongly recommended; without either, warnings only go to Cloud Logging.
 - `ALERT_EMAIL` — email address for Cloud Monitoring notification (optional)
 
 **Auto-resolve `REGION` and `CURRENCY_CODE` from billing account:**
@@ -175,8 +177,9 @@ from google.cloud import billing_v1
 
 PROJECT_ID       = os.environ.get('GCP_PROJECT_ID')
 GCHAT_WEBHOOK    = os.environ.get('GCHAT_WEBHOOK_URL', '')
+SLACK_WEBHOOK    = os.environ.get('SLACK_WEBHOOK_URL', '')
 KILL_SWITCH_MODE = os.environ.get('KILL_SWITCH_MODE', 'sandbox').lower()
-WARN_THRESHOLD   = 0.85  # fire warning between 85% and 100%
+WARN_THRESHOLD   = 0.90  # fire warning between 90% and 100% — under 90% is silent, 100% auto-kills
 
 
 @functions_framework.cloud_event
@@ -211,12 +214,12 @@ def kill_switch(cloud_event):
             'ratio': ratio, 'cost_amount': cost_amount,
             'budget_amount': budget_amount, 'currency': currency,
         }))
-        _notify_webhook(warn_msg, level='warning')
+        _notify_all(warn_msg, level='warning')
         return
 
     # ratio >= 1.0 — kill switch fires
     if KILL_SWITCH_MODE == 'customer':
-        _notify_webhook(
+        _notify_all(
             f"AUTO-KILL IMMINENT for {PROJECT_ID} "
             f"(cost {cost_amount} >= budget {budget_amount} {currency})",
             level='critical',
@@ -241,26 +244,41 @@ def kill_switch(cloud_event):
             'cost_amount': cost_amount, 'budget_amount': budget_amount,
             'currency': currency,
         }))
-        _notify_webhook(alert_msg, level='critical')
+        _notify_all(alert_msg, level='critical')
 
     except Exception as e:
         print(json.dumps({'severity': 'ERROR', 'message': f'ERROR disabling billing: {e}'}))
         raise
 
 
-def _notify_webhook(text: str, level: str = 'critical'):
-    """POST {text} to GCHAT_WEBHOOK_URL. Compatible with Google Chat AND Slack."""
-    if not GCHAT_WEBHOOK:
-        return
+def _notify_all(text: str, level: str = 'critical'):
+    """Fan-out POST {text} to both GCHAT_WEBHOOK_URL and SLACK_WEBHOOK_URL.
+    Payload `{"text": "..."}` is compatible with both Google Chat and Slack
+    incoming webhooks. Per-channel failures are logged but never raised, so
+    one broken channel cannot block the other.
+    """
     prefix = {'warning': '🟡 *Budget Warning*', 'critical': '🔴 *Kill Switch*'}.get(level, '🔴 *Kill Switch*')
-    payload = json.dumps({'text': f'{prefix}\n```{text}```'})
-    req = urllib.request.Request(
-        GCHAT_WEBHOOK,
-        data=payload.encode(),
-        headers={'Content-Type': 'application/json'},
-        method='POST'
-    )
-    urllib.request.urlopen(req, timeout=5)
+    payload = json.dumps({'text': f'{prefix}\n```{text}```'}).encode()
+    for channel, url in (('gchat', GCHAT_WEBHOOK), ('slack', SLACK_WEBHOOK)):
+        if not url:
+            continue
+        req = urllib.request.Request(
+            url, data=payload,
+            headers={'Content-Type': 'application/json'}, method='POST',
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                print(json.dumps({
+                    'severity': 'INFO',
+                    'message': f'notify_{channel} ok status={resp.status}',
+                    'channel': channel,
+                }))
+        except Exception as e:
+            print(json.dumps({
+                'severity': 'ERROR',
+                'message': f'notify_{channel} failed: {e}',
+                'channel': channel,
+            }))
 ```
 
 Write `/tmp/kill-switch-deploy/requirements.txt`:
@@ -276,18 +294,22 @@ web: functions-framework --target=kill_switch --signature-type=cloudevent
 
 > ⚠️ The `Procfile` is required. Without it, Cloud Run Buildpacks will try to find a `app` object in `main.py` and fail with 503.
 
-### 6. Store Chat Webhook (Google Chat or Slack)
+### 6. Store Chat/Slack Webhooks
 
-The secret name (`gchat-killswitch-webhook`) and env var (`GCHAT_WEBHOOK_URL`) are historical — the value can be **either**:
-- Google Chat incoming webhook (`https://chat.googleapis.com/v1/spaces/...`)
-- Slack incoming webhook (`https://hooks.slack.com/services/...`)
+Two independent secrets — store whichever you have. Function fans out to both at runtime if both env vars are set; either one alone also works.
 
-Both accept identical `{"text": "..."}` payload. Choose whichever channel your team monitors.
+| Secret name | Env var | URL shape |
+|---|---|---|
+| `gchat-killswitch-webhook` | `GCHAT_WEBHOOK_URL` | `https://chat.googleapis.com/v1/spaces/...` |
+| `slack-killswitch-webhook` | `SLACK_WEBHOOK_URL` | `https://hooks.slack.com/services/...` |
 
-For P1 rollout: use Slack webhook from `#sre-killswitch-p1` channel.
+Both accept `{"text": "..."}` payload. Each channel POST is wrapped in its own `try/except`, so a 4xx or timeout on one channel never blocks the other.
 
+For P1 rollout: use Slack webhook from `#sre-killswitch-p1` channel plus the team's Google Chat space.
+
+Create the Google Chat secret (skip if not using GChat):
 ```bash
-echo -n 'GCHAT_WEBHOOK_URL' | \
+echo -n 'GCHAT_WEBHOOK_URL_VALUE' | \
   gcloud secrets create gchat-killswitch-webhook \
   --data-file=- \
   --project=PROJECT_ID
@@ -298,13 +320,25 @@ gcloud secrets add-iam-policy-binding gchat-killswitch-webhook \
   --project=PROJECT_ID
 ```
 
-To swap an existing secret value (Chat → Slack) without redeploying:
+Create the Slack secret (skip if not using Slack):
+```bash
+echo -n 'SLACK_WEBHOOK_URL_VALUE' | \
+  gcloud secrets create slack-killswitch-webhook \
+  --data-file=- \
+  --project=PROJECT_ID
+
+gcloud secrets add-iam-policy-binding slack-killswitch-webhook \
+  --member="serviceAccount:billing-killswitch-sa@PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor" \
+  --project=PROJECT_ID
+```
+
+Rotate a secret value without redeploying (Cloud Run picks up `:latest` on next cold start; service-update forces immediate refresh):
 ```bash
 echo -n 'NEW_WEBHOOK_URL' | \
   gcloud secrets versions add gchat-killswitch-webhook \
-  --data-file=- \
-  --project=PROJECT_ID
-# Cloud Run picks up :latest on next cold start — restart the service to apply immediately:
+  --data-file=- --project=PROJECT_ID
+# same for slack-killswitch-webhook
 gcloud run services update billing-kill-switch --region=REGION --project=PROJECT_ID
 ```
 
@@ -312,12 +346,26 @@ gcloud run services update billing-kill-switch --region=REGION --project=PROJECT
 
 **Choose `KILL_SWITCH_MODE`:**
 
-Both modes emit a warning at 85–99% (no billing change) and disable billing at 100%. The difference: `customer` adds one extra "AUTO-KILL IMMINENT" webhook moments before the 100% kill call.
+Both modes emit a warning at 90–99% (no billing change) and disable billing at 100%. The difference: `customer` adds one extra "AUTO-KILL IMMINENT" webhook moments before the 100% kill call.
 
-- `sandbox` (default) — 85–99% warning, 100% kill (no pre-kill alert). Use for non-customer-facing projects.
-- `customer` — 85–99% warning, 100% pre-kill imminent webhook → kill. Use for live customer projects.
+- `sandbox` (default) — 90–99% warning, 100% kill (no pre-kill alert). Use for non-customer-facing projects.
+- `customer` — 90–99% warning, 100% pre-kill imminent webhook → kill. Use for live customer projects.
 
-With Chat/Slack webhook:
+With both webhooks (recommended):
+```bash
+gcloud run deploy billing-kill-switch \
+  --source=/tmp/kill-switch-deploy \
+  --region=REGION \
+  --service-account=billing-killswitch-sa@PROJECT_ID.iam.gserviceaccount.com \
+  --set-env-vars=GCP_PROJECT_ID=PROJECT_ID,KILL_SWITCH_MODE=KILL_SWITCH_MODE \
+  --set-secrets=GCHAT_WEBHOOK_URL=gchat-killswitch-webhook:latest,SLACK_WEBHOOK_URL=slack-killswitch-webhook:latest \
+  --no-allow-unauthenticated \
+  --max-instances=3 \
+  --timeout=60 \
+  --project=PROJECT_ID
+```
+
+With only Google Chat webhook:
 ```bash
 gcloud run deploy billing-kill-switch \
   --source=/tmp/kill-switch-deploy \
@@ -331,7 +379,21 @@ gcloud run deploy billing-kill-switch \
   --project=PROJECT_ID
 ```
 
-Without webhook:
+With only Slack webhook:
+```bash
+gcloud run deploy billing-kill-switch \
+  --source=/tmp/kill-switch-deploy \
+  --region=REGION \
+  --service-account=billing-killswitch-sa@PROJECT_ID.iam.gserviceaccount.com \
+  --set-env-vars=GCP_PROJECT_ID=PROJECT_ID,KILL_SWITCH_MODE=KILL_SWITCH_MODE \
+  --set-secrets=SLACK_WEBHOOK_URL=slack-killswitch-webhook:latest \
+  --no-allow-unauthenticated \
+  --max-instances=3 \
+  --timeout=60 \
+  --project=PROJECT_ID
+```
+
+Without any webhook (warnings only in Cloud Logging):
 ```bash
 gcloud run deploy billing-kill-switch \
   --source=/tmp/kill-switch-deploy \
@@ -344,7 +406,7 @@ gcloud run deploy billing-kill-switch \
   --project=PROJECT_ID
 ```
 
-> ⚠️ Without a webhook, warnings only land in Cloud Logging — nobody gets paged. Strongly recommended for both modes.
+> ⚠️ Without at least one webhook, warnings only land in Cloud Logging — nobody gets paged. Strongly recommended for both modes.
 
 ### 8. Create Eventarc Trigger
 
