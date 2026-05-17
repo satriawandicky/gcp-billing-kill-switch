@@ -9,7 +9,7 @@ PROJECT_ID       = os.environ.get('GCP_PROJECT_ID')
 GCHAT_WEBHOOK    = os.environ.get('GCHAT_WEBHOOK_URL', '')
 SLACK_WEBHOOK    = os.environ.get('SLACK_WEBHOOK_URL', '')
 KILL_SWITCH_MODE = os.environ.get('KILL_SWITCH_MODE', 'sandbox').lower()
-WARN_THRESHOLD   = 0.85  # fire warning between 85% and 100%
+WARN_THRESHOLD   = 0.90  # fire warning between 90% and 100% — under 90% is silent, 100% auto-kills
 
 
 @functions_framework.cloud_event
