@@ -7,6 +7,7 @@ from google.cloud import billing_v1
 
 PROJECT_ID       = os.environ.get('GCP_PROJECT_ID')
 GCHAT_WEBHOOK    = os.environ.get('GCHAT_WEBHOOK_URL', '')
+SLACK_WEBHOOK    = os.environ.get('SLACK_WEBHOOK_URL', '')
 KILL_SWITCH_MODE = os.environ.get('KILL_SWITCH_MODE', 'sandbox').lower()
 WARN_THRESHOLD   = 0.85  # fire warning between 85% and 100%
 
@@ -47,12 +48,12 @@ def kill_switch(cloud_event):
             'budget_amount': budget_amount,
             'currency': currency,
         }))
-        _notify_webhook(warn_msg, level='warning')
+        _notify_all(warn_msg, level='warning')
         return
 
     # ratio >= 1.0 — kill switch fires
     if KILL_SWITCH_MODE == 'customer':
-        _notify_webhook(
+        _notify_all(
             f"AUTO-KILL IMMINENT for {PROJECT_ID} "
             f"(cost {cost_amount} >= budget {budget_amount} {currency})",
             level='critical',
@@ -80,27 +81,38 @@ def kill_switch(cloud_event):
             'budget_amount': budget_amount,
             'currency': currency,
         }))
-        _notify_webhook(alert_msg, level='critical')
+        _notify_all(alert_msg, level='critical')
 
     except Exception as e:
         print(json.dumps({'severity': 'ERROR', 'message': f'ERROR disabling billing: {e}'}))
         raise
 
 
-def _notify_webhook(text: str, level: str = 'critical'):
-    """POST {text} to GCHAT_WEBHOOK_URL. Payload is compatible with both
-    Google Chat and Slack incoming webhooks.
+def _notify_all(text: str, level: str = 'critical'):
+    """Fan-out POST {text} to both GCHAT_WEBHOOK_URL and SLACK_WEBHOOK_URL.
+    Payload `{"text": "..."}` is compatible with both Google Chat and Slack
+    incoming webhooks. Per-channel failures are logged but never raised, so
+    one broken channel cannot block the other.
     """
-    if not GCHAT_WEBHOOK:
-        return
     prefix = {'warning': '🟡 *Budget Warning*', 'critical': '🔴 *Kill Switch*'}.get(level, '🔴 *Kill Switch*')
-    payload = json.dumps({
-        'text': f'{prefix}\n```{text}```'
-    })
-    req = urllib.request.Request(
-        GCHAT_WEBHOOK,
-        data=payload.encode(),
-        headers={'Content-Type': 'application/json'},
-        method='POST'
-    )
-    urllib.request.urlopen(req, timeout=5)
+    payload = json.dumps({'text': f'{prefix}\n```{text}```'}).encode()
+    for channel, url in (('gchat', GCHAT_WEBHOOK), ('slack', SLACK_WEBHOOK)):
+        if not url:
+            continue
+        req = urllib.request.Request(
+            url, data=payload,
+            headers={'Content-Type': 'application/json'}, method='POST',
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                print(json.dumps({
+                    'severity': 'INFO',
+                    'message': f'notify_{channel} ok status={resp.status}',
+                    'channel': channel,
+                }))
+        except Exception as e:
+            print(json.dumps({
+                'severity': 'ERROR',
+                'message': f'notify_{channel} failed: {e}',
+                'channel': channel,
+            }))
