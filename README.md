@@ -69,25 +69,33 @@ flowchart TD
 
     subgraph MESSAGING ["Event Pipeline (with DLQ)"]
         C[📨 Pub/Sub Topic\nbudget-alerts]
-        D[⚡ Eventarc Trigger\n+ retry policy]
+        D[⚡ Eventarc Trigger\n5 retries]
         DLQ[💀 Dead-Letter Topic\nbudget-alerts-dlq]
         DLQSUB[📥 Pull Sub\nbudget-alerts-dlq-sub]
     end
 
-    subgraph FUNCTION ["Cloud Run Function Gen2"]
-        E[🔧 billing-kill-switch]
-        E0{ratio?}
-        EW[Slack/Chat warning\nNO billing change]
-        E2[Disable Billing\nvia Cloud Billing API]
-        E3[Log CRITICAL\nstructured JSON]
+    subgraph FUNCTION ["Cloud Run Function Gen2 — billing-kill-switch"]
+        E[🔧 kill_switch handler\nKILL_SWITCH_MODE = sandbox or customer]
+        E0{ratio vs<br/>WARN_THRESHOLD<br/>0.90 / 1.00}
+        EOK([✅ Budget OK\nearly return])
+        EW[🟡 Warning notify\nBUDGET WARNING NN%\nNO billing change]
+        EPRE[🔴 Pre-kill notify\nAUTO-KILL IMMINENT\ncustomer mode only]
+        E2[🔴 Cloud Billing API\nupdateProjectBillingInfo\nbilling_account_name=]
+        E3[🔴 Kill confirmed notify\nKILL SWITCH TRIGGERED]
     end
 
-    subgraph NOTIFICATIONS ["Notifications"]
-        FG[💬 Google Chat Webhook\nGCHAT_WEBHOOK_URL]
-        FS[💬 Slack Webhook\nSLACK_WEBHOOK_URL]
+    subgraph NOTIFY_FN ["_notify_all fanout — per-channel try/except"]
+        NF[📨 Build payload\nprefix + text]
+        NG[POST GCHAT_WEBHOOK_URL]
+        NS[POST SLACK_WEBHOOK_URL]
+    end
+
+    subgraph NOTIFICATIONS ["External Notification Endpoints"]
+        FG[💬 Google Chat Space]
+        FS[💬 Slack Channel]
         G[📧 Cloud Monitoring\nEmail Alert]
         DLQA[🚨 DLQ Age Alert\n>5 min unacked]
-        H[📋 Cloud Logging\nAudit Trail]
+        H[📋 Cloud Logging\nstructured JSON\nnotify_channel ok or failed]
     end
 
     subgraph TARGET ["Protected Project"]
@@ -96,34 +104,54 @@ flowchart TD
 
     B -->|publishes event| C
     C --> D
-    D -->|push, 5 retries| E
+    D -->|push| E
     D -->|after 5 fails| DLQ
     DLQ --> DLQSUB
     DLQSUB -->|oldest_unacked_message_age| DLQA
-    DLQA --> FG
-    DLQA --> FS
+    DLQA --> NF
+
     E --> E0
-    E0 -->|< 90%| Z([✅ No action])
-    E0 -->|90–99%| EW
-    EW --> FG
-    EW --> FS
-    E0 -->|>= 100%| E2
+    E0 -->|ratio < 0.90| EOK
+    E0 -->|0.90 ≤ ratio < 1.00| EW
+    E0 -->|ratio ≥ 1.00 customer| EPRE
+    E0 -->|ratio ≥ 1.00 sandbox| E2
+    EPRE --> NF
+    EPRE --> E2
+    EW --> NF
     E2 --> E3
     E2 -->|unlink billing account| I
-    E2 -->|webhook POST| FG
-    E2 -->|webhook POST| FS
+    E3 --> NF
+
+    NF --> NG
+    NF --> NS
+    NG -.->|status=200<br/>or 4xx/timeout<br/>logged not raised| FG
+    NS -.->|status=200<br/>or 4xx/timeout<br/>logged not raised| FS
+    NG --> H
+    NS --> H
     E3 -->|log ingestion| H
     H -->|log-based alert| G
 
     style BUDGET fill:#fff3cd,stroke:#ffc107
     style MESSAGING fill:#d1ecf1,stroke:#17a2b8
     style FUNCTION fill:#d4edda,stroke:#28a745
+    style NOTIFY_FN fill:#e2f0d9,stroke:#5cb85c
     style NOTIFICATIONS fill:#e2d9f3,stroke:#6f42c1
     style TARGET fill:#f8d7da,stroke:#dc3545
     style I fill:#f8d7da,stroke:#dc3545,color:#721c24
     style DLQ fill:#f8d7da,stroke:#dc3545
     style DLQA fill:#f8d7da,stroke:#dc3545
+    style EW fill:#fff3cd,stroke:#ffc107
+    style EPRE fill:#ffe1e0,stroke:#dc3545
+    style E2 fill:#ffe1e0,stroke:#dc3545
+    style E3 fill:#ffe1e0,stroke:#dc3545
 ```
+
+**Reading the flow:**
+- `ratio < 0.90` → early return, no notify, no kill (silent)
+- `0.90 ≤ ratio < 1.00` → 🟡 warning fans out to both webhooks via `_notify_all`; **billing untouched** in both modes
+- `ratio ≥ 1.00, customer mode` → 🔴 pre-kill "AUTO-KILL IMMINENT" notify fires **before** the Cloud Billing API call, so the team gets a heads-up even if the disable call hangs
+- `ratio ≥ 1.00, sandbox mode` → 🔴 straight to billing disable, then kill-confirmed notify
+- Each `_notify_all` POST is wrapped in its own `try/except`; per-channel outcomes (`notify_gchat ok status=200` / `notify_slack failed: ...`) land in Cloud Logging — one broken webhook never blocks the other
 
 ### Component Table
 
@@ -240,6 +268,45 @@ Log-based alert detects `KILL SWITCH TRIGGERED` in Cloud Run logs → sends emai
 
 ## Manual Test
 
+### Option A — Non-destructive 90% warning test (safe for production)
+
+Publishes a synthetic 90% budget message. Expected: 🟡 warning fans out to both webhooks, billing remains `enabled=True`.
+
+```bash
+gcloud pubsub topics publish budget-alerts \
+  --project=YOUR_PROJECT_ID \
+  --message='{"budgetDisplayName":"TEST-90-WARN","alertThresholdExceeded":0.9,"costAmount":9.0,"budgetAmount":10.0,"currencyCode":"USD"}'
+```
+
+Check logs (wait ~15s for cold-start):
+```bash
+gcloud logging read \
+  'resource.type="cloud_run_revision" AND resource.labels.service_name="billing-kill-switch"' \
+  --project=YOUR_PROJECT_ID --limit=15 \
+  --format='value(timestamp,severity,textPayload,jsonPayload.message,jsonPayload.channel)' \
+  --order=desc
+```
+
+Expected lines:
+```
+Budget check: 9.0/10.0 USD (90%) mode=sandbox
+BUDGET WARNING (90%)
+  Budget 'TEST-90-WARN': 9.0/10.0 USD
+  Project: YOUR_PROJECT_ID (mode=sandbox)
+notify_gchat ok status=200    gchat
+notify_slack ok status=200    slack
+```
+
+Verify billing stayed enabled:
+```bash
+gcloud beta billing projects describe YOUR_PROJECT_ID --format='value(billingEnabled)'
+# Expected: True
+```
+
+### Option B — Full 100% kill test (sandbox only — causes real outage)
+
+> ⚠️ This actually disables billing. All running services on the project will stop within minutes.
+
 ```bash
 gcloud pubsub topics publish budget-alerts \
   --project=YOUR_PROJECT_ID \
@@ -249,7 +316,7 @@ gcloud pubsub topics publish budget-alerts \
 Check logs:
 ```bash
 gcloud run services logs read billing-kill-switch \
-  --region=asia-southeast2 \
+  --region=YOUR_REGION \
   --project=YOUR_PROJECT_ID \
   --limit=10
 ```
@@ -259,6 +326,8 @@ Expected:
 KILL SWITCH TRIGGERED
 Budget 'TEST-KILL-SWITCH': 1000 >= 100 USD
 Billing DISABLED for: YOUR_PROJECT_ID
+notify_gchat ok status=200
+notify_slack ok status=200
 ```
 
 Restore billing after test:
